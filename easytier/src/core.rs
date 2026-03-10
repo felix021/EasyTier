@@ -12,7 +12,7 @@ use crate::{
         config::{
             get_avaliable_encrypt_methods, load_config_from_file, ConfigFileControl, ConfigLoader,
             ConsoleLoggerConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity,
-            PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig,
+            PeerConfig, PortForwardConfig, ShadowsocksConfig, TomlConfigLoader, VpnPortalConfig,
         },
         constants::EASYTIER_VERSION,
         log,
@@ -650,6 +650,35 @@ struct NetworkOptions {
         help = t!("core_clap.credential_file").to_string()
     )]
     credential_file: Option<PathBuf>,
+
+    // Shadowsocks options
+    #[cfg(feature = "shadowsocks")]
+    #[arg(
+        long,
+        env = "ET_SHADOWSOCKS",
+        value_delimiter = ',',
+        help = "Shadowsocks proxy endpoints. Format: name://cipher:password@host:port",
+        num_args = 0..
+    )]
+    shadowsocks: Vec<String>,
+
+    #[cfg(feature = "shadowsocks")]
+    #[arg(
+        long,
+        env = "ET_SHADOWSOCKS_RULES",
+        value_delimiter = ',',
+        help = "Shadowsocks routing rules. Format: RULE_TYPE,value,target (e.g., IP-CIDR,10.0.0.0/8,DIRECT, GEOIP,CN,node1, FALLBACK,node2)",
+        num_args = 0..
+    )]
+    shadowsocks_rules: Vec<String>,
+
+    #[cfg(feature = "shadowsocks")]
+    #[arg(
+        long,
+        env = "ET_GEOIP_DATABASE",
+        help = "Path to GEOIP database file (MaxMind MMDB format)"
+    )]
+    geoip_database: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -1117,6 +1146,32 @@ impl NetworkOptions {
             old_stun_servers_v6.extend(stun_servers_v6.iter().cloned());
             cfg.set_stun_servers_v6(Some(old_stun_servers_v6));
         }
+
+        // Process Shadowsocks configuration
+        #[cfg(feature = "shadowsocks")]
+        {
+            if !self.shadowsocks.is_empty() {
+                let endpoints = ShadowsocksConfig::parse_endpoints(&self.shadowsocks)
+                    .context("failed to parse shadowsocks endpoints")?;
+
+                let rules = ShadowsocksConfig::parse_rules(&self.shadowsocks_rules)
+                    .context("failed to parse shadowsocks rules")?;
+
+                let ss_config = ShadowsocksConfig {
+                    endpoints,
+                    rules,
+                    geoip_database: self.geoip_database.clone(),
+                };
+
+                cfg.set_shadowsocks_config(Some(ss_config.clone()));
+                tracing::info!(
+                    "Shadowsocks configured with {} endpoints and {} rules",
+                    ss_config.endpoints.len(),
+                    ss_config.rules.len(),
+                );
+            }
+        }
+
         Ok(())
     }
 }

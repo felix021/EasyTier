@@ -32,8 +32,10 @@ use crate::gateway::icmp_proxy::IcmpProxy;
 use crate::gateway::kcp_proxy::{KcpProxyDst, KcpProxyDstRpcService, KcpProxySrc};
 #[cfg(feature = "quic")]
 use crate::gateway::quic_proxy::{QuicProxy, QuicProxyDstRpcService};
-use crate::gateway::tcp_proxy::{NatDstTcpConnector, TcpProxy, TcpProxyRpcService};
+use crate::gateway::tcp_proxy::{TcpProxy, TcpProxyRpcService};
 use crate::gateway::udp_proxy::UdpProxy;
+#[cfg(feature = "shadowsocks")]
+use crate::gateway::shadowsocks_connector::ShadowsocksTcpConnector;
 use crate::peer_center::instance::{PeerCenterInstance, PeerCenterInstanceService};
 use crate::peers::peer_conn::PeerConnId;
 use crate::peers::peer_manager::{PeerManager, RouteAlgoType};
@@ -69,9 +71,17 @@ use super::listeners::ListenerManager;
 #[cfg(feature = "socks5")]
 use crate::gateway::socks5::Socks5Server;
 
+/// The TCP connector type to use for the IP proxy
+/// When shadowsocks is enabled and configured, use ShadowsocksTcpConnector
+/// Otherwise, use the standard NatDstTcpConnector
+#[cfg(feature = "shadowsocks")]
+type IpProxyTcpConnector = ShadowsocksTcpConnector;
+#[cfg(not(feature = "shadowsocks"))]
+type IpProxyTcpConnector = NatDstTcpConnector;
+
 #[derive(Clone)]
 struct IpProxy {
-    tcp_proxy: Arc<TcpProxy<NatDstTcpConnector>>,
+    tcp_proxy: Arc<TcpProxy<IpProxyTcpConnector>>,
     icmp_proxy: Arc<IcmpProxy>,
     udp_proxy: Arc<UdpProxy>,
     global_ctx: ArcGlobalCtx,
@@ -80,7 +90,12 @@ struct IpProxy {
 
 impl IpProxy {
     fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Result<Self, Error> {
-        let tcp_proxy = TcpProxy::new(peer_manager.clone(), NatDstTcpConnector {});
+        #[cfg(feature = "shadowsocks")]
+        let connector = ShadowsocksTcpConnector::new(global_ctx.clone());
+        #[cfg(not(feature = "shadowsocks"))]
+        let connector = NatDstTcpConnector {};
+
+        let tcp_proxy = TcpProxy::new(peer_manager.clone(), connector);
         let icmp_proxy = IcmpProxy::new(global_ctx.clone(), peer_manager.clone())
             .with_context(|| "create icmp proxy failed")?;
         let udp_proxy = UdpProxy::new(global_ctx.clone(), peer_manager)

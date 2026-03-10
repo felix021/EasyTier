@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
+use percent_encoding;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 
@@ -221,6 +222,11 @@ pub trait ConfigLoader: Send + Sync {
     }
     fn set_credential_file(&self, _path: Option<std::path::PathBuf>) {}
 
+    fn get_shadowsocks_config(&self) -> Option<ShadowsocksConfig> {
+        None
+    }
+    fn set_shadowsocks_config(&self, _config: Option<ShadowsocksConfig>) {}
+
     fn dump(&self) -> String;
 }
 
@@ -405,6 +411,162 @@ impl From<PortForwardConfig> for PortForwardConfigPb {
     }
 }
 
+// Shadowsocks configuration structures
+
+/// Shadowsocks endpoint configuration
+/// URL format: name://cipher:password@host:port
+/// Example: node1://aes-256-cfb:mypassword@127.0.0.1:2001
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct ShadowsocksEndpoint {
+    pub name: String,
+    pub cipher: String,
+    pub password: String,
+    pub server: String,
+}
+
+impl ShadowsocksEndpoint {
+    /// Parse from URL format: name://cipher:password@host:port
+    pub fn parse(url: &str) -> Result<Self, anyhow::Error> {
+        let parsed = url::Url::parse(url)
+            .with_context(|| format!("failed to parse shadowsocks URL: {}", url))?;
+
+        let name = parsed.scheme().to_string();
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("missing host in shadowsocks URL"))?;
+        let port = parsed
+            .port()
+            .ok_or_else(|| anyhow::anyhow!("missing port in shadowsocks URL"))?;
+        let server = format!("{}:{}", host, port);
+
+        let username = parsed.username();
+        let password = parsed
+            .password()
+            .ok_or_else(|| anyhow::anyhow!("missing password in shadowsocks URL"))?;
+
+        // URL-decode the username (cipher) and password
+        let cipher = percent_encoding::percent_decode_str(username)
+            .decode_utf8()
+            .map_err(|e| anyhow::anyhow!("failed to decode cipher: {}", e))?
+            .to_string();
+        let password = percent_encoding::percent_decode_str(password)
+            .decode_utf8()
+            .map_err(|e| anyhow::anyhow!("failed to decode password: {}", e))?
+            .to_string();
+
+        Ok(Self {
+            name,
+            cipher,
+            password,
+            server,
+        })
+    }
+}
+
+/// Shadowsocks rule type
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum ShadowsocksRuleType {
+    /// IP-CIDR rule: IP-CIDR,cidr,target
+    #[serde(rename = "IP-CIDR")]
+    IpCidr,
+    /// GEOIP rule: GEOIP,country_code,target
+    #[serde(rename = "GEOIP")]
+    Geoip,
+    /// FALLBACK rule: FALLBACK,target (must be last)
+    #[serde(rename = "FALLBACK")]
+    Fallback,
+}
+
+impl std::fmt::Display for ShadowsocksRuleType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IpCidr => write!(f, "IP-CIDR"),
+            Self::Geoip => write!(f, "GEOIP"),
+            Self::Fallback => write!(f, "FALLBACK"),
+        }
+    }
+}
+
+/// Shadowsocks routing rule
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct ShadowsocksRule {
+    pub rule_type: ShadowsocksRuleType,
+    pub value: String,
+    /// Target endpoint name or "DIRECT" for direct connection
+    pub target: String,
+}
+
+impl ShadowsocksRule {
+    /// Parse from string format: RULE_TYPE,value,target
+    pub fn parse(rule: &str) -> Result<Self, anyhow::Error> {
+        let parts: Vec<&str> = rule.splitn(3, ',').collect();
+        if parts.len() < 2 {
+            return Err(anyhow::anyhow!(
+                "invalid shadowsocks rule format, expected: RULE_TYPE,value,target or FALLBACK,target, got: {}",
+                rule
+            ));
+        }
+
+        let rule_type = match parts[0].to_uppercase().as_str() {
+            "IP-CIDR" => ShadowsocksRuleType::IpCidr,
+            "GEOIP" => ShadowsocksRuleType::Geoip,
+            "FALLBACK" => ShadowsocksRuleType::Fallback,
+            _ => return Err(anyhow::anyhow!("unknown shadowsocks rule type: {}", parts[0])),
+        };
+
+        // For FALLBACK, the format is: FALLBACK,target
+        let (value, target) = if rule_type == ShadowsocksRuleType::Fallback {
+            (String::new(), parts[1].to_string())
+        } else {
+            if parts.len() != 3 {
+                return Err(anyhow::anyhow!(
+                    "invalid shadowsocks rule format for {}, expected: {},value,target, got: {}",
+                    parts[0],
+                    parts[0],
+                    rule
+                ));
+            }
+            (parts[1].to_string(), parts[2].to_string())
+        };
+
+        Ok(Self {
+            rule_type,
+            value,
+            target,
+        })
+    }
+}
+
+/// Shadowsocks configuration containing endpoints and routing rules
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ShadowsocksConfig {
+    /// List of Shadowsocks endpoints
+    #[serde(default)]
+    pub endpoints: Vec<ShadowsocksEndpoint>,
+    /// Routing rules (processed in order)
+    #[serde(default)]
+    pub rules: Vec<ShadowsocksRule>,
+    /// Path to GEOIP database (MaxMind MMDB format)
+    pub geoip_database: Option<PathBuf>,
+}
+
+impl ShadowsocksConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse endpoints from URL strings
+    pub fn parse_endpoints(urls: &[String]) -> Result<Vec<ShadowsocksEndpoint>, anyhow::Error> {
+        urls.iter().map(|url| ShadowsocksEndpoint::parse(url)).collect()
+    }
+
+    /// Parse rules from rule strings
+    pub fn parse_rules(rules: &[String]) -> Result<Vec<ShadowsocksRule>, anyhow::Error> {
+        rules.iter().map(|rule| ShadowsocksRule::parse(rule)).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct Config {
     netns: Option<String>,
@@ -445,6 +607,21 @@ struct Config {
     stun_servers_v6: Option<Vec<String>>,
 
     credential_file: Option<PathBuf>,
+
+    /// Shadowsocks endpoints as URL strings
+    #[cfg(feature = "shadowsocks")]
+    #[serde(default)]
+    shadowsocks: Option<Vec<String>>,
+
+    /// Shadowsocks routing rules
+    #[cfg(feature = "shadowsocks")]
+    #[serde(default)]
+    shadowsocks_rules: Option<Vec<String>>,
+
+    /// Path to GEOIP database
+    #[cfg(feature = "shadowsocks")]
+    #[serde(default)]
+    geoip_database: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -844,6 +1021,61 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_credential_file(&self, path: Option<PathBuf>) {
         self.config.lock().unwrap().credential_file = path;
+    }
+
+    fn get_shadowsocks_config(&self) -> Option<ShadowsocksConfig> {
+        #[cfg(feature = "shadowsocks")]
+        {
+            let config = self.config.lock().unwrap();
+            let endpoints_urls = config.shadowsocks.clone().unwrap_or_default();
+            let rules_strs = config.shadowsocks_rules.clone().unwrap_or_default();
+            let geoip_db = config.geoip_database.clone();
+
+            if endpoints_urls.is_empty() {
+                return None;
+            }
+
+            let endpoints = ShadowsocksConfig::parse_endpoints(&endpoints_urls).ok()?;
+            let rules = ShadowsocksConfig::parse_rules(&rules_strs).ok().unwrap_or_default();
+
+            tracing::info!("Shadowsocks configured with {} endpoints and {} rules", endpoints.len(), rules.len());
+
+            Some(ShadowsocksConfig {
+                endpoints,
+                rules,
+                geoip_database: geoip_db,
+            })
+        }
+
+        #[cfg(not(feature = "shadowsocks"))]
+        {
+            None
+        }
+    }
+
+    fn set_shadowsocks_config(&self, config: Option<ShadowsocksConfig>) {
+        #[cfg(feature = "shadowsocks")]
+        {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(ss_config) = config {
+                let endpoint_urls: Vec<String> = ss_config.endpoints
+                    .iter()
+                    .map(|e| format!("{}://{}:{}@{}", e.name, e.cipher, e.password, e.server))
+                    .collect();
+                cfg.shadowsocks = Some(endpoint_urls);
+                cfg.shadowsocks_rules = Some(ss_config.rules.iter().map(|r| {
+                    match r.rule_type {
+                        ShadowsocksRuleType::Fallback => format!("FALLBACK,{}", r.target),
+                        _ => format!("{},{},{}", r.rule_type, r.value, r.target),
+                    }
+                }).collect());
+                cfg.geoip_database = ss_config.geoip_database;
+            } else {
+                cfg.shadowsocks = None;
+                cfg.shadowsocks_rules = None;
+                cfg.geoip_database = None;
+            }
+        }
     }
 
     fn dump(&self) -> String {
@@ -1725,5 +1957,162 @@ enable_encryption = ${MIXED_ENCRYPTION}
         std::env::remove_var("MIXED_MTU");
         std::env::remove_var("MIXED_ENCRYPTION");
         std::env::remove_var("MIXED_LISTEN_PORT");
+    }
+
+    /// Shadowsocks 配置解析测试
+    ///
+    /// 验证：
+    /// - shadowsocks 端点 URL 数组正确解析
+    /// - shadowsocks_rules 规则数组正确解析
+    /// - geoip_database 路径正确解析
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn test_shadowsocks_config_parsing() {
+        let config_str = r#"
+instance_name = "shadowsocks-test"
+shadowsocks = [
+    "node1://aes-256-cfb:password123@127.0.0.1:2001",
+    "node2://chacha20-ietf:secret456@192.168.1.100:8888"
+]
+shadowsocks_rules = [
+    "IP-CIDR,127.0.0.0/8,DIRECT",
+    "IP-CIDR,192.168.0.0/16,DIRECT",
+    "GEOIP,CN,DIRECT",
+    "FALLBACK,node1"
+]
+geoip_database = "/tmp/Country.mmdb"
+
+[network_identity]
+network_name = "test-network"
+network_secret = "test-secret"
+"#;
+
+        let config = TomlConfigLoader::new_from_str(config_str).unwrap();
+
+        // Test get_shadowsocks_config 能正确解析
+        let ss_config = config.get_shadowsocks_config();
+        assert!(ss_config.is_some(), "Shadowsocks config should be parsed");
+
+        let ss_config = ss_config.unwrap();
+
+        // 测试端点解析
+        assert_eq!(ss_config.endpoints.len(), 2, "Should have 2 endpoints");
+
+        // 测试第一个端点
+        assert_eq!(ss_config.endpoints[0].name, "node1");
+        assert_eq!(ss_config.endpoints[0].cipher, "aes-256-cfb");
+        assert_eq!(ss_config.endpoints[0].password, "password123");
+        assert_eq!(ss_config.endpoints[0].server, "127.0.0.1:2001");
+
+        // 测试第二个端点
+        assert_eq!(ss_config.endpoints[1].name, "node2");
+        assert_eq!(ss_config.endpoints[1].cipher, "chacha20-ietf");
+        assert_eq!(ss_config.endpoints[1].password, "secret456");
+        assert_eq!(ss_config.endpoints[1].server, "192.168.1.100:8888");
+
+        // 测试规则解析
+        assert_eq!(ss_config.rules.len(), 4, "Should have 4 rules");
+
+        // 测试第一条规则 (IP-CIDR)
+        assert_eq!(ss_config.rules[0].rule_type, ShadowsocksRuleType::IpCidr);
+        assert_eq!(ss_config.rules[0].value, "127.0.0.0/8");
+        assert_eq!(ss_config.rules[0].target, "DIRECT");
+
+        // 测试第二条规则 (IP-CIDR)
+        assert_eq!(ss_config.rules[1].rule_type, ShadowsocksRuleType::IpCidr);
+        assert_eq!(ss_config.rules[1].value, "192.168.0.0/16");
+        assert_eq!(ss_config.rules[1].target, "DIRECT");
+
+        // 测试第三条规则 (GEOIP)
+        assert_eq!(ss_config.rules[2].rule_type, ShadowsocksRuleType::Geoip);
+        assert_eq!(ss_config.rules[2].value, "CN");
+        assert_eq!(ss_config.rules[2].target, "DIRECT");
+
+        // 测试第四条规则 (FALLBACK)
+        assert_eq!(ss_config.rules[3].rule_type, ShadowsocksRuleType::Fallback);
+        assert_eq!(ss_config.rules[3].value, "");
+        assert_eq!(ss_config.rules[3].target, "node1");
+
+        // 测试 GEOIP 数据库路径
+        assert_eq!(ss_config.geoip_database, Some(PathBuf::from("/tmp/Country.mmdb")));
+    }
+
+    /// Shadowsocks 空配置测试
+    ///
+    /// 验证：
+    /// - 没有 shadowsocks 配置时返回 None
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn test_shadowsocks_empty_config() {
+        let config_str = r#"
+instance_name = "no-shadowsocks"
+
+[network_identity]
+network_name = "test-network"
+network_secret = "test-secret"
+"#;
+
+        let config = TomlConfigLoader::new_from_str(config_str).unwrap();
+        let ss_config = config.get_shadowsocks_config();
+        assert!(ss_config.is_none(), "Should return None when no shadowsocks config");
+    }
+
+    /// Shadowsocks 仅端点配置测试（无规则）
+    ///
+    /// 验证：
+    /// - 只有端点没有规则时也能正确解析
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn test_shadowsocks_endpoints_only() {
+        let config_str = r#"
+instance_name = "endpoints-only"
+shadowsocks = [
+    "proxy://aes-256-cfb:pass@10.0.0.1:9999"
+]
+
+[network_identity]
+network_name = "test-network"
+network_secret = "test-secret"
+"#;
+
+        let config = TomlConfigLoader::new_from_str(config_str).unwrap();
+        let ss_config = config.get_shadowsocks_config().unwrap();
+
+        assert_eq!(ss_config.endpoints.len(), 1);
+        assert_eq!(ss_config.endpoints[0].name, "proxy");
+        assert!(ss_config.rules.is_empty(), "Rules should be empty");
+        assert_eq!(ss_config.geoip_database, None);
+    }
+
+    /// Shadowsocks 规则解析错误处理测试
+    ///
+    /// 验证：
+    /// - 无效规则导致整个解析失败（返回空规则列表）
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn test_shadowsocks_invalid_rule_handling() {
+        let config_str = r#"
+instance_name = "invalid-rules"
+shadowsocks = [
+    "node1://aes-256-cfb:pass@127.0.0.1:2001"
+]
+shadowsocks_rules = [
+    "INVALID_RULE_FORMAT",
+    "IP-CIDR,10.0.0.0/8,DIRECT",
+    "ANOTHER_INVALID"
+]
+
+[network_identity]
+network_name = "test-network"
+network_secret = "test-secret"
+"#;
+
+        let config = TomlConfigLoader::new_from_str(config_str).unwrap();
+        let ss_config = config.get_shadowsocks_config().unwrap();
+
+        // 应该解析出端点
+        assert_eq!(ss_config.endpoints.len(), 1);
+        // 无效规则会导致整个规则列表为空
+        assert!(ss_config.rules.is_empty(), "Invalid rules should result in empty rules list");
     }
 }

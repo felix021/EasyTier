@@ -265,7 +265,7 @@ enum ProxyTcpListener {
     SmolTcpListener(SmolTcpListener),
 }
 
-fn prepare_kernel_tcp_socket(stream: &TcpStream) -> Result<()> {
+pub(crate) fn prepare_kernel_tcp_socket(stream: &TcpStream) -> Result<()> {
     const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(5);
     const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
     const TCP_KEEPALIVE_RETRIES: u32 = 2;

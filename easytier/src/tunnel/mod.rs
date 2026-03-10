@@ -44,6 +44,9 @@ pub mod quic;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
+
 #[cfg(any(feature = "quic", feature = "websocket"))]
 pub mod insecure_tls;
 

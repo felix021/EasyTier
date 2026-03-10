@@ -246,6 +246,10 @@ shellexpand = "3.1.1"
 flume = { version = "0.12", optional = true }
 cfg-if = "1.0"
 
+# for shadowsocks
+maxminddb = { version = "0.24", optional = true }
+shadowsocks = { version = "1.21", optional = true }
+
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "freebsd"))'.dependencies]
 machine-uid = "0.5.3"
 
@@ -354,6 +358,7 @@ default = [
     "faketcp",
     "magic-dns",
     "zstd",
+    "shadowsocks",
 ]
 full = [
     "websocket",
@@ -368,6 +373,7 @@ full = [
     "faketcp",
     "magic-dns",
     "zstd",
+    "shadowsocks",
 ]
 wireguard = ["dep:boringtun", "dep:ring"]
 quic = ["dep:quinn", "dep:quinn-plaintext", "dep:rustls", "dep:rcgen"]
@@ -397,5 +403,7 @@ tracing = ["tokio/tracing", "dep:console-subscriber"]
 magic-dns = ["dep:hickory-client", "dep:hickory-server"]
 faketcp = ["dep:flume"]
 zstd = ["dep:zstd"]
+shadowsocks = ["dep:maxminddb", "dep:shadowsocks"]
+
 # For Network Extension on macOS
 macos-ne = []

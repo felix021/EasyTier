@@ -33,6 +33,9 @@ use super::{
     PeerId,
 };
 
+#[cfg(feature = "shadowsocks")]
+use crate::gateway::shadowsocks_router::ShadowsocksRouter;
+
 pub type NetworkIdentity = crate::common::config::NetworkIdentity;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -189,6 +192,10 @@ pub struct GlobalCtx {
     /// OSPF propagated trusted keys (peer pubkeys and admin credentials)
     /// Stored in ArcSwap for lock-free reads and atomic batch updates
     trusted_keys: Arc<TrustedKeyMapManager>,
+
+    /// Shadowsocks router for outbound traffic routing
+    #[cfg(feature = "shadowsocks")]
+    shadowsocks_router: Option<Arc<ShadowsocksRouter>>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -247,6 +254,24 @@ impl GlobalCtx {
         let credential_storage_path = config_fs.get_credential_file();
         let credential_manager = Arc::new(CredentialManager::new(credential_storage_path));
 
+        // Initialize Shadowsocks router if configured
+        #[cfg(feature = "shadowsocks")]
+        let shadowsocks_router = config_fs
+            .get_shadowsocks_config()
+            .and_then(|config| {
+                if config.endpoints.is_empty() {
+                    None
+                } else {
+                    match ShadowsocksRouter::new(&config) {
+                        Ok(router) => Some(Arc::new(router)),
+                        Err(e) => {
+                            tracing::error!("Failed to initialize shadowsocks router: {}", e);
+                            None
+                        }
+                    }
+                }
+            });
+
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
             id,
@@ -286,6 +311,9 @@ impl GlobalCtx {
             credential_manager,
 
             trusted_keys: Arc::new(TrustedKeyMapManager::new()),
+
+            #[cfg(feature = "shadowsocks")]
+            shadowsocks_router,
         }
     }
 
@@ -505,6 +533,12 @@ impl GlobalCtx {
 
     pub fn get_credential_manager(&self) -> &Arc<CredentialManager> {
         &self.credential_manager
+    }
+
+    /// Get the shadowsocks router for outbound traffic routing
+    #[cfg(feature = "shadowsocks")]
+    pub fn get_shadowsocks_router(&self) -> Option<&Arc<ShadowsocksRouter>> {
+        self.shadowsocks_router.as_ref()
     }
 
     /// Check if a public key is trusted using two-level lookup:

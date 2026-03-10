@@ -23,6 +23,11 @@ mod wrapped_proxy;
 #[cfg(feature = "quic")]
 pub mod quic_proxy;
 
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks_router;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks_connector;
+
 #[derive(Debug)]
 pub(crate) struct CidrSet {
     global_ctx: ArcGlobalCtx,
