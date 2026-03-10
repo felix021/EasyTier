@@ -83,6 +83,8 @@ enum SocksTcpStream {
     SmolTcp(super::tokio_smoltcp::TcpStream),
     #[cfg(feature = "kcp")]
     Kcp(KcpStream),
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks(crate::gateway::shadowsocks_connector::ShadowsocksTcpStream),
 }
 
 impl AsyncRead for SocksTcpStream {
@@ -98,6 +100,8 @@ impl AsyncRead for SocksTcpStream {
             }
             #[cfg(feature = "kcp")]
             SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "shadowsocks")]
+            SocksTcpStream::Shadowsocks(ref mut stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -115,6 +119,8 @@ impl AsyncWrite for SocksTcpStream {
             }
             #[cfg(feature = "kcp")]
             SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "shadowsocks")]
+            SocksTcpStream::Shadowsocks(ref mut stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -127,6 +133,8 @@ impl AsyncWrite for SocksTcpStream {
             SocksTcpStream::SmolTcp(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "kcp")]
             SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "shadowsocks")]
+            SocksTcpStream::Shadowsocks(ref mut stream) => std::pin::Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -139,6 +147,8 @@ impl AsyncWrite for SocksTcpStream {
             SocksTcpStream::SmolTcp(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "kcp")]
             SocksTcpStream::Kcp(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "shadowsocks")]
+            SocksTcpStream::Shadowsocks(ref mut stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -262,6 +272,7 @@ struct Socks5AutoConnector {
     entry_count: Arc<AtomicUsize>,
     smoltcp_net: Option<Arc<Net>>,
     src_addr: SocketAddr,
+    global_ctx: Arc<GlobalCtx>,
 
     inner_connector: parking_lot::Mutex<Option<Box<dyn Any + Send>>>,
 }
@@ -287,6 +298,32 @@ impl AsyncTcpConnector for Socks5AutoConnector {
         if let Some(local_addr) = self.smoltcp_net.as_ref().map(|n| n.get_address()) {
             if local_addr == addr.ip() {
                 addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port());
+            }
+        }
+
+        // Check shadowsocks routing rules first (for non-virtual-network traffic)
+        #[cfg(feature = "shadowsocks")]
+        {
+            use crate::gateway::shadowsocks_connector::ShadowsocksTcpConnector;
+            use crate::gateway::shadowsocks_connector::ShadowsocksTcpStream as SsTcpStream;
+
+            if let Some(endpoint_name) = self.global_ctx.get_shadowsocks_router().and_then(|r| r.route(&addr.ip())) {
+                if endpoint_name != "DIRECT" {
+                    tracing::debug!("Shadowsocks routing: IP {} -> endpoint {}", addr.ip(), endpoint_name);
+                    // Connect through shadowsocks
+                    let stream = ShadowsocksTcpConnector::new(self.global_ctx.clone())
+                        .connect_via_shadowsocks_by_addr(endpoint_name.to_string(), addr, timeout_s)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Shadowsocks connection failed: {}", e))?;
+
+                    return Ok(match stream {
+                        SsTcpStream::Direct(s) => SocksTcpStream::Tcp(s),
+                        #[cfg(feature = "shadowsocks")]
+                        SsTcpStream::Proxied(s) => SocksTcpStream::Shadowsocks(SsTcpStream::Proxied(s)),
+                    });
+                } else {
+                    tracing::debug!("Shadowsocks routing: IP {} -> DIRECT", addr.ip());
+                }
             }
         }
 
@@ -715,6 +752,7 @@ impl Socks5Server {
             let entry_count = self.entry_count.clone();
             let peer_manager = self.peer_manager.clone();
             let net = self.net.clone();
+            let global_ctx = self.global_ctx.clone();
             self.tasks.lock().unwrap().spawn(async move {
                 loop {
                     match listener.accept().await {
@@ -731,6 +769,7 @@ impl Socks5Server {
                                 kcp_endpoint: kcp_endpoint.clone(),
                                 peer_mgr: peer_manager.clone(),
                                 src_addr: addr,
+                                global_ctx: global_ctx.clone(),
                                 inner_connector: parking_lot::Mutex::new(None),
                                 entry_count: entry_count.clone(),
                             };
@@ -852,6 +891,7 @@ impl Socks5Server {
         #[cfg(feature = "kcp")]
         let kcp_endpoint = self.kcp_endpoint.lock().await.clone();
         let peer_mgr = self.peer_manager.clone();
+        let global_ctx = self.global_ctx.clone();
         let cancel_token = CancellationToken::new();
         self.cancel_tokens
             .insert(cfg.clone(), cancel_token.clone().drop_guard());
@@ -888,6 +928,7 @@ impl Socks5Server {
                     entries: entries.clone(),
                     smoltcp_net: net.lock().await.as_ref().map(|net| net.smoltcp_net.clone()),
                     src_addr: addr,
+                    global_ctx: global_ctx.clone(),
                     entry_count: entry_count.clone(),
                     inner_connector: parking_lot::Mutex::new(None),
                 };

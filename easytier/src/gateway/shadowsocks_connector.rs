@@ -129,9 +129,11 @@ impl ShadowsocksTcpConnector {
             dst, endpoint.name, endpoint.server
         );
 
-        // Parse server address from string
-        let server_addr: SocketAddr = endpoint.server.parse()
-            .map_err(|e| anyhow::anyhow!("Invalid server address '{}': {}", endpoint.server, e))?;
+        // Resolve server address (support both IP and domain name)
+        let server_addr: SocketAddr = tokio::net::lookup_host(&endpoint.server)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Failed to resolve server address: {}", endpoint.server))?;
 
         // Parse cipher kind using FromStr
         let method = CipherKind::from_str(&endpoint.cipher)
@@ -169,6 +171,21 @@ impl ShadowsocksTcpConnector {
         );
 
         Ok(proxy_stream)
+    }
+
+    /// Public method to connect via shadowsocks by address (for socks5 integration)
+    #[cfg(feature = "shadowsocks")]
+    pub async fn connect_via_shadowsocks_by_addr(
+        &self,
+        endpoint_name: String,
+        dst: SocketAddr,
+        timeout_s: u64,
+    ) -> EasyTierResult<ShadowsocksTcpStream> {
+        let proxy_stream = timeout(Duration::from_secs(timeout_s),
+            self.connect_via_shadowsocks(endpoint_name, dst)
+        )
+        .await??;
+        Ok(ShadowsocksTcpStream::Proxied(proxy_stream))
     }
 }
 
