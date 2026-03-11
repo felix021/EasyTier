@@ -29,12 +29,65 @@ use crate::{
     gateway::ip_reassembler::{compose_ipv4_packet, ComposeIpv4PacketArgs},
     peers::{peer_manager::PeerManager, PeerPacketFilter},
     tunnel::{
-        common::{reserve_buf, setup_sokcet2},
+        common::reserve_buf,
         packet_def::{PacketType, ZCPacket},
     },
 };
 
 use super::{ip_reassembler::IpReassembler, CidrSet};
+
+#[cfg(feature = "shadowsocks")]
+use crate::gateway::shadowsocks_udp_connector::ShadowsocksUdpSocket as SsUdpSocket;
+
+/// UDP socket wrapper that supports both direct and shadowsocks-proxied connections
+enum UdpNatSocket {
+    Direct(UdpSocket),
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks(SsUdpSocket),
+}
+
+impl std::fmt::Debug for UdpNatSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(_) => f.debug_tuple("Direct").finish(),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) => f.debug_tuple("Shadowsocks").finish(),
+        }
+    }
+}
+
+impl UdpNatSocket {
+    /// Create a direct UDP socket
+    async fn direct() -> Result<Self, Error> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self::Direct(socket))
+    }
+
+    /// Create a shadowsocks-proxied UDP socket
+    #[cfg(feature = "shadowsocks")]
+    async fn proxied(global_ctx: ArcGlobalCtx, endpoint_name: &str) -> Result<Self, Error> {
+        let ss_socket = SsUdpSocket::proxied(global_ctx, endpoint_name).await?;
+        Ok(Self::Shadowsocks(ss_socket))
+    }
+
+    /// Send data to destination
+    async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<usize, Error> {
+        match self {
+            Self::Direct(socket) => socket.send_to(buf, dst).await.map_err(Into::into),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(socket) => socket.send_to(buf, dst).await,
+        }
+    }
+
+    /// Receive data from socket
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
+        match self {
+            Self::Direct(socket) => socket.recv_from(buf).await.map_err(Into::into),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(socket) => socket.recv_from(buf).await,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpNatKey {
@@ -46,7 +99,8 @@ struct UdpNatEntry {
     src_peer_id: PeerId,
     my_peer_id: PeerId,
     src_socket: SocketAddr,
-    socket: Option<UdpSocket>,
+    real_dst: SocketAddr,
+    socket: Option<UdpNatSocket>,
     forward_task: Mutex<Option<JoinHandle<()>>>,
     stopped: AtomicBool,
     start_time: std::time::Instant,
@@ -60,33 +114,54 @@ impl UdpNatEntry {
         src_peer_id: PeerId,
         my_peer_id: PeerId,
         src_socket: SocketAddr,
+        real_dst: SocketAddr,
         denied: bool,
     ) -> Result<Self, Error> {
-        // TODO: try use src port, so we will be ip restricted nat type
-        let socket = if denied {
-            None
-        } else {
-            let socket2_socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
-            let dst_socket_addr = "0.0.0.0:0".parse().unwrap();
-            setup_sokcet2(&socket2_socket, &dst_socket_addr)?;
-            Some(UdpSocket::from_std(socket2_socket.into())?)
-        };
-
+        // Socket is created asynchronously in forward_task
         Ok(Self {
             src_peer_id,
             my_peer_id,
             src_socket,
-            socket,
+            real_dst,
+            socket: None,
             forward_task: Mutex::new(None),
             stopped: AtomicBool::new(false),
             start_time: std::time::Instant::now(),
             last_active_time: AtomicCell::new(std::time::Instant::now()),
             denied,
         })
+    }
+
+    /// Create the appropriate socket based on destination and shadowsocks routing
+    async fn create_socket(
+        global_ctx: &ArcGlobalCtx,
+        real_dst: SocketAddr,
+    ) -> Result<UdpNatSocket, Error> {
+        #[cfg(feature = "shadowsocks")]
+        {
+            // Check shadowsocks routing
+            if let Some(router) = global_ctx.get_shadowsocks_router() {
+                if let Some(endpoint_name) = router.route(&real_dst.ip()) {
+                    if endpoint_name != "DIRECT" {
+                        tracing::info!(
+                            "UDP Shadowsocks routing: {} -> endpoint {}",
+                            real_dst,
+                            endpoint_name
+                        );
+                        return UdpNatSocket::proxied(global_ctx.clone(), endpoint_name).await;
+                    } else {
+                        tracing::debug!(
+                            "UDP routing DIRECT for {} (GEOIP/CIDR match)",
+                            real_dst
+                        );
+                    }
+                }
+            }
+        }
+
+        // Direct socket
+        tracing::trace!("UDP creating direct socket for {}", real_dst);
+        UdpNatSocket::direct().await
     }
 
     pub fn stop(&self) {
@@ -154,8 +229,30 @@ impl UdpNatEntry {
         virtual_ipv4: Ipv4Addr,
         real_ipv4: Ipv4Addr,
         mapped_ipv4: Ipv4Addr,
+        global_ctx: ArcGlobalCtx,
+        initial_payload: Option<Vec<u8>>,
     ) {
         let (s, mut r) = channel(128);
+
+        // Create the appropriate socket (direct or shadowsocks)
+        let socket = match Self::create_socket(&global_ctx, self.real_dst).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to create UDP socket for {}: {:?}", self.real_dst, e);
+                self.stop();
+                return;
+            }
+        };
+
+        // Send initial payload if provided
+        if let Some(payload) = initial_payload {
+            if let Err(e) = socket.send_to(&payload, self.real_dst).await {
+                tracing::error!("Failed to send initial UDP packet to {}: {:?}", self.real_dst, e);
+                self.stop();
+                return;
+            }
+            tracing::trace!("Sent initial UDP packet to {}", self.real_dst);
+        }
 
         let self_clone = self.clone();
         let recv_task = ScopedTask::from(tokio::spawn(async move {
@@ -176,11 +273,7 @@ impl UdpNatEntry {
 
                 let (len, src_socket) = match timeout(
                     Duration::from_secs(120),
-                    self_clone
-                        .socket
-                        .as_ref()
-                        .unwrap()
-                        .recv_buf_from(&mut cur_buf),
+                    socket.recv_from(&mut cur_buf),
                 )
                 .await
                 {
@@ -346,6 +439,7 @@ impl UdpProxy {
                     hdr.from_peer_id.get(),
                     hdr.to_peer_id.get(),
                     nat_key.src_socket,
+                    dst_socket,
                     denied,
                 )?))
             })
@@ -361,6 +455,7 @@ impl UdpProxy {
         }
 
         if nat_entry.forward_task.lock().await.is_none() {
+            let payload = udp_packet.payload().to_vec();
             nat_entry
                 .forward_task
                 .lock()
@@ -371,30 +466,15 @@ impl UdpProxy {
                     self.global_ctx.get_ipv4().map(|x| x.address())?,
                     real_dst_ip,
                     ipv4.get_destination(),
+                    self.global_ctx.clone(),
+                    Some(payload),
                 )));
         }
 
         nat_entry.mark_active();
 
-        let send_ret = {
-            let _g = self.global_ctx.net_ns.guard();
-            nat_entry
-                .socket
-                .as_ref()
-                .unwrap()
-                .send_to(udp_packet.payload(), dst_socket)
-                .await
-        };
-
-        if let Err(send_err) = send_ret {
-            tracing::error!(
-                ?send_err,
-                ?nat_key,
-                ?nat_entry,
-                ?send_err,
-                "udp nat send failed"
-            );
-        }
+        // The packet will be sent by the forward_task through the appropriate socket
+        // No direct send needed here
 
         Some(())
     }

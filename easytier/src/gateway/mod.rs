@@ -27,6 +27,8 @@ pub mod quic_proxy;
 pub mod shadowsocks_router;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks_connector;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks_udp_connector;
 
 #[derive(Debug)]
 pub(crate) struct CidrSet {
